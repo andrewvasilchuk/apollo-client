@@ -6,6 +6,7 @@ import { ApolloContextValue, getApolloContext } from '../context';
 import { ApolloError } from '../../errors';
 import {
   ApolloClient,
+  ApolloQueryResult,
   NetworkStatus,
   FetchMoreQueryOptions,
   SubscribeToMoreOptions,
@@ -14,6 +15,7 @@ import {
   UpdateQueryOptions,
   DocumentNode,
   TypedDocumentNode,
+  WatchQueryOptions,
 } from '../../core';
 import {
   QueryDataOptions,
@@ -41,6 +43,24 @@ function verifyDocumentType(document: DocumentNode, type: DocumentType) {
   );
 }
 
+function prepareOptions<TData, TVariables>(
+  options: QueryDataOptions<TData, TVariables>,
+  context: ApolloContextValue,
+): WatchQueryOptions<TVariables, TData> {
+  return {
+    ...options,
+    fetchPolicy:
+      context &&
+      context.renderPromises &&
+      (
+        options.fetchPolicy === 'network-only' ||
+        options.fetchPolicy === 'cache-and-network'
+      )
+      ? 'cache-first'
+      : options.fetchPolicy,
+  };
+}
+
 
 // The interface expected by RenderPromises
 interface QueryData<TData, TVariables> {
@@ -51,22 +71,22 @@ interface QueryData<TData, TVariables> {
 class QueryData<TData, TVariables> {
   public isMounted: boolean;
   public context: ApolloContextValue;
-  private options = {} as QueryDataOptions<TData, TVariables>;
+  private options: QueryDataOptions<TData, TVariables>;
   private onNewData: () => void;
   private currentObservable?: ObservableQuery<TData, TVariables>;
   private currentSubscription?: ObservableSubscription;
   private previous: {
     client?: ApolloClient<object>;
-    query?: DocumentNode | TypedDocumentNode<TData, TVariables>;
     options?: QueryDataOptions<TData, TVariables>;
-    // TODO(brian): WHAT IS THE DIFFERENCE???????????
-    observableQueryOptions?: QueryDataOptions<TData, TVariables>;
+    // TODO(brian): deduplicate with
+    query?: DocumentNode | TypedDocumentNode<TData, TVariables>;
+    observableQueryOptions?: WatchQueryOptions<TVariables, TData>;
     // TODO(brian): previous.result should be assigned once in an update, we
     // shouldn’t have loading/error defined separately
     result?: QueryResult<TData, TVariables>;
     loading?: boolean;
     error?: ApolloError;
-  } = Object.create(null);
+  };
 
   constructor({
     options,
@@ -81,28 +101,17 @@ class QueryData<TData, TVariables> {
     this.context = context || {};
     this.onNewData = onNewData;
     this.isMounted = false;
+    this.previous = {};
   }
 
   public getOptions(): QueryDataOptions<TData, TVariables> {
     return this.options;
   }
 
-  public setOptions(newOptions: QueryDataOptions<TData, TVariables>) {
-    if (!equal(this.options, newOptions)) {
-      this.previous.options = this.options;
-    }
-
-    this.options = newOptions;
-  }
-
   public fetchData(): Promise<void> | boolean {
     const options = this.options;
     if (options.skip || options.ssr === false) return false;
     return new Promise(resolve => this.startQuerySubscription(resolve));
-  }
-
-  private ssrInitiated() {
-    return this.context && this.context.renderPromises;
   }
 
   public cleanup() {
@@ -118,8 +127,19 @@ class QueryData<TData, TVariables> {
     }
   }
 
-  public execute(client: ApolloClient<object>): QueryResult<TData, TVariables> {
-    const { skip, query } = this.options;
+  public execute(
+    client: ApolloClient<object>,
+    options: QueryDataOptions<TData, TVariables>
+  ): QueryResult<TData, TVariables> {
+    // TODO: STOP ASSIGNING OPTIONS HERE
+    if (!equal(this.options, options)) {
+      this.previous.options = this.options;
+      this.options = options;
+    }
+
+    const { skip, query, ssr } = this.options;
+    verifyDocumentType(query, DocumentType.Query);
+    // if skip, query, or client are different we restart?
     if (this.previous.client !== client) {
       if (this.previous.client) {
         this.cleanup();
@@ -135,22 +155,7 @@ class QueryData<TData, TVariables> {
       this.previous.query = query;
     }
 
-    verifyDocumentType(this.options.query, DocumentType.Query);
-    const observableQueryOptions = {
-      ...this.options,
-      fetchPolicy:
-        this.context &&
-        this.context.renderPromises &&
-          (
-            this.options.fetchPolicy === 'network-only' ||
-            this.options.fetchPolicy === 'cache-and-network'
-          )
-        ? 'cache-first'
-        : this.options.fetchPolicy,
-      displayName: this.options.displayName || 'Query',
-      children: void 0,
-    };
-
+    const observableQueryOptions = prepareOptions(this.options, this.context);
     // If we skipped initially, we may not have yet created the observable
     if (!this.currentObservable) {
       // See if there is an existing observable that was used to fetch the same
@@ -173,24 +178,21 @@ class QueryData<TData, TVariables> {
           );
         }
       }
-    } else {
-      if (this.options.skip) {
-        this.previous.observableQueryOptions = observableQueryOptions;
-      } else if (
-        !equal(observableQueryOptions, this.previous.observableQueryOptions)
-      ) {
-        this.previous.observableQueryOptions = observableQueryOptions;
-        this.currentObservable
-          .setOptions(observableQueryOptions)
-          // The error will be passed to the child container, so we don't
-          // need to log it here. We could conceivably log something if
-          // an option was set. OTOH we don't log errors w/ the original
-          // query. See https://github.com/apollostack/react-apollo/issues/404
-          .catch(() => {});
-      }
+    } else if (skip) {
+      this.previous.observableQueryOptions = observableQueryOptions;
+    } else if (
+      !equal(observableQueryOptions, this.previous.observableQueryOptions)
+    ) {
+      this.previous.observableQueryOptions = observableQueryOptions;
+      this.currentObservable
+        .setOptions(observableQueryOptions)
+        // The error will be passed to the child container, so we don't
+        // need to log it here. We could conceivably log something if
+        // an option was set. OTOH we don't log errors w/ the original
+        // query. See https://github.com/apollostack/react-apollo/issues/404
+        .catch(() => {});
     }
 
-    const { ssr } = this.options;
     const ssrDisabled = ssr === false;
     const ssrLoading = {
       ...this.observableQueryFields(),
@@ -204,15 +206,16 @@ class QueryData<TData, TVariables> {
 
     // If SSR has been explicitly disabled, and this function has been called
     // on the server side, return the default loading state.
-    if (ssrDisabled && (this.ssrInitiated() || client.disableNetworkFetches)) {
+    if (
+      ssrDisabled &&
+      (this.context.renderPromises || client.disableNetworkFetches)
+    ) {
       // TODO(brian): Don’t assign this here.
       this.previous.result = ssrLoading;
       return ssrLoading;
     }
 
     const result = this.observableQueryFields() as QueryResult<TData, TVariables>;
-    const options = this.options;
-
     // When skipping a query (ie. we're not querying for data but still want
     // to render children), make sure the `data` is cleared out and
     // `loading` is set to `false` (since we aren't loading anything).
@@ -223,7 +226,7 @@ class QueryData<TData, TVariables> {
     // that previously received data is all of a sudden removed. Unfortunately,
     // changing this is breaking, so we'll have to wait until Apollo Client
     // 4.0 to address this.
-    if (options.skip) {
+    if (skip) {
       Object.assign(result, {
         data: undefined,
         error: undefined,
@@ -260,7 +263,7 @@ class QueryData<TData, TVariables> {
         });
       } else {
         const { fetchPolicy } = this.currentObservable.options;
-        const { partialRefetch } = options;
+        const { partialRefetch } = this.options;
         if (
           partialRefetch &&
           partial &&
@@ -286,9 +289,7 @@ class QueryData<TData, TVariables> {
     }
 
     result.client = client;
-    this.setOptions(options);
     const previousResult = this.previous.result;
-
 
     // Ensure the returned result contains previousData as a separate
     // property, to give developers the flexibility of leveraging outdated
@@ -438,14 +439,14 @@ class QueryData<TData, TVariables> {
   private obsFetchMore = (
     fetchMoreOptions: FetchMoreQueryOptions<TVariables, TData> &
       FetchMoreOptions<TData, TVariables>
-  ) => this.currentObservable!.fetchMore(fetchMoreOptions);
+  ) => this.currentObservable?.fetchMore(fetchMoreOptions);
 
   private obsUpdateQuery = <TVars = TVariables>(
     mapFn: (
       previousQueryResult: TData,
       options: UpdateQueryOptions<TVars>
     ) => TData
-  ) => this.currentObservable!.updateQuery(mapFn);
+  ) => this.currentObservable?.updateQuery(mapFn);
 
   private obsStartPolling = (pollInterval: number) => {
     this.currentObservable?.startPolling(pollInterval);
@@ -464,7 +465,7 @@ class QueryData<TData, TVariables> {
       TSubscriptionVariables,
       TSubscriptionData
     >
-  ) => this.currentObservable!.subscribeToMore(options);
+  ) => this.currentObservable?.subscribeToMore(options);
 
   private observableQueryFields() {
     return {
@@ -477,6 +478,102 @@ class QueryData<TData, TVariables> {
       subscribeToMore: this.obsSubscribeToMore
     } as ObservableQueryFields<TData, TVariables>;
   }
+}
+
+export function useQuery1<
+  TData = any,
+  TVariables = OperationVariables,
+>(
+  client: ApolloClient<unknown>,
+  query: DocumentNode | TypedDocumentNode<TData, TVariables>,
+  options: QueryDataOptions<TData, TVariables>,
+): ObservableQuery<TData, TVariables> {
+  const previousRef = useRef<{
+    client: ApolloClient<unknown>,
+    query: DocumentNode | TypedDocumentNode<TData, TVariables>,
+    options: QueryDataOptions<TData, TVariables>,
+    result?: ApolloQueryResult<TData> | undefined,
+  }>({ client, query, options, result: undefined });
+
+  const obsQueryRef = useRef<ObservableQuery<TData, TVariables>>();
+
+  if (!obsQueryRef.current) {
+    obsQueryRef.current = client.watchQuery(options);
+  }
+
+  const subscriptionRef = useRef<ObservableSubscription>();
+
+  useEffect(() => {
+    if (
+      previousRef.current.client !== client ||
+      !equal(previousRef.current.query, query)
+    ) {
+      obsQueryRef.current = client.watchQuery(options);
+    }
+
+    if (
+      obsQueryRef.current &&
+      !equal(previousRef.current.options, options)
+    ) {
+      obsQueryRef.current.setOptions(options);
+    }
+
+    Object.assign(previousRef.current, {
+      client,
+      query,
+      options,
+    });
+
+    return () => {
+      if (!subscriptionRef.current) {
+        obsQueryRef.current?.['tearDownQuery']();
+      }
+    };
+  }, [client, query, options]);
+
+  useEffect(() => {
+    if (!obsQueryRef.current) {
+      return;
+    }
+
+    const obsQuery = obsQueryRef.current;
+    subscriptionRef.current = obsQueryRef.current.subscribe(
+      (nextResult) => {
+        const previousResult = previousRef.current.result;
+        // Make sure we're not attempting to re-render similar results
+        if (
+          previousResult &&
+          previousResult.loading === nextResult.loading &&
+          previousResult.networkStatus === nextResult.networkStatus &&
+          equal(previousResult.data, nextResult.data)
+        ) {
+          return;
+        }
+
+        previousRef.current.result = nextResult;
+      },
+      (error) => {
+        subscriptionRef.current = undefined;
+        // Unfortunately, if `lastError` is set in the current
+        // `observableQuery` when the subscription is re-created, the
+        // subscription will immediately receive the error, which will cause
+        // it to terminate again. To avoid this, we first clear the last
+        // error/result from the `observableQuery` before re-starting the
+        // subscription, and restore it afterwards (so the subscription has a
+        // chance to stay open).
+        //const lastError = obsQuery.getLastError();
+        //const lastResult = obsQuery.getLastResult();
+        obsQuery.resetLastResults();
+        //this.startQuerySubscription();
+        //Object.assign(obsQuery, { lastError, lastResult });
+      },
+    );
+
+    return () => {
+    };
+  }, [obsQueryRef.current]);
+
+  return obsQueryRef.current;
 }
 
 export function useQuery<TData = any, TVariables = OperationVariables>(
@@ -493,7 +590,7 @@ export function useQuery<TData = any, TVariables = OperationVariables>(
   );
 
   const [tick, forceUpdate] = useReducer(x => x + 1, 0);
-  const updatedOptions: QueryDataOptions<TData, TVariables> = {
+  const optionsWithQuery: QueryDataOptions<TData, TVariables> = {
     ...options,
     query,
   };
@@ -501,7 +598,7 @@ export function useQuery<TData = any, TVariables = OperationVariables>(
   const queryDataRef = useRef<QueryData<TData, TVariables>>();
   const queryData = queryDataRef.current || (
     queryDataRef.current = new QueryData<TData, TVariables>({
-      options: updatedOptions,
+      options: optionsWithQuery,
       context,
       onNewData() {
         if (queryDataRef.current && queryDataRef.current.isMounted) {
@@ -511,11 +608,10 @@ export function useQuery<TData = any, TVariables = OperationVariables>(
     })
   );
 
-  queryData.setOptions(updatedOptions);
   queryData.context = context;
   const result = useDeepMemo(
-    () => queryData.execute(client),
-    [updatedOptions, context, tick],
+    () => queryData.execute(client, optionsWithQuery),
+    [optionsWithQuery, context, tick],
   );
 
   if (__DEV__) {
